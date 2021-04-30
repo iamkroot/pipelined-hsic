@@ -1,3 +1,4 @@
+import logging
 import os
 import threading
 import time
@@ -15,6 +16,8 @@ from torch.distributed.nn.api.remote_module import RemoteModule
 from torch.distributed.optim import DistributedOptimizer
 from torch.distributed.rpc import RRef
 from torch.utils.data.dataloader import DataLoader
+
+logging.basicConfig(format="{process}.{thread} - {asctime} - {message}", style="{", level=logging.DEBUG)
 
 model = nn.Sequential(
     nn.Linear(784, 100),
@@ -103,11 +106,12 @@ def run_master(microbatch_size, num_workers):
                 _, pred = torch.max(outputs.data, 1)
                 total += labels.size(0)
                 correct += (pred == labels).sum().item()
-        print(round(correct * 100 / total, 4))
+        logging.info(f"Accuracy {correct * 100 / total:.2f}%")
 
+    logging.info("Starting")
     for i, data in enumerate(loader):
         if i % 100 == 0:
-            print(f"Processing batch {i}")
+            logging.info(f"Processing batch {i}")
             test(model, testloader)
 
         inputs, labels = data
@@ -119,7 +123,6 @@ def run_master(microbatch_size, num_workers):
             dist_autograd.backward(context_id, [loss_fn(outputs, labels)])
             opt.step(context_id)
 
-    print("Final accuracy")
     test(model, testloader)
 
 
@@ -130,6 +133,7 @@ def run_worker(rank, world_size, microbatch_size):
     options = rpc.TensorPipeRpcBackendOptions(num_worker_threads=256)
 
     if rank == 0:
+        logging.info("Initting master")
         rpc.init_rpc(
             "master",
             rank=rank,
@@ -138,6 +142,7 @@ def run_worker(rank, world_size, microbatch_size):
         )
         run_master(microbatch_size, world_size - 1)
     else:
+        logging.info(f"Initting rank{rank}")
         rpc.init_rpc(
             f"worker{rank}",
             rank=rank,
@@ -154,8 +159,9 @@ if __name__ == "__main__":
     sizes = [BATCH_SIZE]
     while sizes[-1] > 2:
         sizes.append(sizes[-1] // 2)
-    for microbatch_size in sizes:
+    for microbatch_size in sizes[:1]:
+        logging.info(f"{microbatch_size=}")
         tik = time.time()
         mp.spawn(run_worker, args=(world_size, microbatch_size), nprocs=world_size, join=True)
         tok = time.time()
-        print(f"{microbatch_size=}, execution time = {tok - tik}")
+        logging.info(f"{microbatch_size=} execution_time={tok - tik:.3f}s")
