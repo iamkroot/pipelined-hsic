@@ -1,7 +1,9 @@
+import argparse
 import logging
 import os
 import threading
 import time
+from ipaddress import IPv4Address
 from itertools import chain
 from typing import Iterable
 
@@ -18,18 +20,6 @@ from torch.distributed.rpc import RRef
 from torch.utils.data.dataloader import DataLoader
 
 logging.basicConfig(format="{process}.{thread} - {asctime} - {message}", style="{", level=logging.DEBUG)
-
-model = nn.Sequential(
-    nn.Linear(784, 100),
-    nn.ReLU(),
-    nn.Linear(100, 100),
-    nn.ReLU(),
-    nn.Linear(100, 10),
-    nn.ReLU(),
-)
-
-shards = [model[:2], model[2:4], model[4:]]
-BATCH_SIZE = 64
 
 
 class RemoteSeq(nn.Module):
@@ -77,7 +67,7 @@ class DistMNIST(nn.Module):
         return list(chain.from_iterable(shard.remote_parameters() for shard in self.shards))
 
 
-def run_master(microbatch_size, num_workers):
+def run_master(batch_size, microbatch_size, num_workers):
     workers = [f"worker{i}/cpu" for i in range(1, num_workers + 1)]
     # TODO: Add support for CUDA, some minor changes needed in RemoteSeq.forward()
     model = DistMNIST(workers, shards, microbatch_size)
@@ -94,9 +84,9 @@ def run_master(microbatch_size, num_workers):
     ])
     DATA_DIR = "../data/"
     mnist = torchvision.datasets.MNIST(DATA_DIR, train=True, download=True, transform=trans)
-    loader = DataLoader(mnist, batch_size=BATCH_SIZE, shuffle=True)
+    loader = DataLoader(mnist, batch_size=batch_size, shuffle=True)
     mnist_test = torchvision.datasets.MNIST(DATA_DIR, train=False, download=True, transform=trans)
-    testloader = DataLoader(mnist_test, batch_size=BATCH_SIZE, shuffle=False)
+    testloader = DataLoader(mnist_test, batch_size=batch_size, shuffle=False)
 
     def test(model, testloader):
         correct, total = 0, 0
@@ -126,10 +116,7 @@ def run_master(microbatch_size, num_workers):
     test(model, testloader)
 
 
-def run_worker(rank, world_size, microbatch_size):
-    os.environ['MASTER_ADDR'] = 'localhost'
-    os.environ['MASTER_PORT'] = '29500'
-
+def run_worker(rank, world_size, batch_size, microbatch_size):
     options = rpc.TensorPipeRpcBackendOptions(num_worker_threads=256)
 
     if rank == 0:
@@ -140,7 +127,7 @@ def run_worker(rank, world_size, microbatch_size):
             world_size=world_size,
             rpc_backend_options=options
         )
-        run_master(microbatch_size, world_size - 1)
+        run_master(batch_size, microbatch_size, world_size - 1)
     else:
         logging.info(f"Initting rank{rank}")
         rpc.init_rpc(
@@ -154,14 +141,58 @@ def run_worker(rank, world_size, microbatch_size):
     rpc.shutdown()
 
 
+def gen_sizes(microbatch_size: list[int], batch_size: int) -> list[int]:
+    """Generate the microbatch sizes if needed"""
+    if not microbatch_size:
+        # generate the sizes if not specified by user
+        sizes = [batch_size]
+        # sizes = [batch_size, batch_size / 2, batch_size / 4, ..., 1]
+        while sizes[-1] >= 2:
+            sizes.append(sizes[-1] // 2)
+    else:
+        # use user-provided sizes
+        sizes = microbatch_size
+    return sizes
+
+
+model = nn.Sequential(
+    nn.Linear(784, 100),
+    nn.ReLU(),
+    nn.Linear(100, 100),
+    nn.ReLU(),
+    nn.Linear(100, 10),
+    nn.ReLU(),
+)
+
+# hardcoded 3 shards for now
+shards = [model[:2], model[2:4], model[4:]]
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--master-addr", type=IPv4Address, default=IPv4Address("127.0.0.1"))
+    parser.add_argument("--master-port", type=int, default=29500)
+    parser.add_argument("--rank", type=int, default=-1)
+    parser.add_argument("--world-size", "-s", type=int, default=4)
+    parser.add_argument("--batch-size", "-b", type=int, default=64)
+    parser.add_argument("--microbatch-size", "-m", type=int, default=64)
+    args = parser.parse_args()
+
+    os.environ['MASTER_ADDR'] = str(args.master_addr)
+    os.environ['MASTER_PORT'] = str(args.master_port)
+    world_size = args.world_size
+    batch_size = args.batch_size
+    microbatch_size = args.microbatch_size
+
+    logging.info(f"{world_size=} {batch_size=} {microbatch_size=}")
+    tik = time.time()
+    if args.rank == -1:  # local run, spawn processes on current cpu
+        mp.spawn(run_worker, args=(world_size, batch_size, microbatch_size), nprocs=world_size, join=True)
+    else:  # distributed run, run only one worker with given rank
+        run_worker(args.rank, world_size, batch_size, microbatch_size)
+    tok = time.time()
+    logging.info(f"execution_time={tok - tik:.3f}s")
+
+
 if __name__ == "__main__":
-    world_size = 4
-    sizes = [BATCH_SIZE]
-    while sizes[-1] > 2:
-        sizes.append(sizes[-1] // 2)
-    for microbatch_size in sizes[:1]:
-        logging.info(f"{microbatch_size=}")
-        tik = time.time()
-        mp.spawn(run_worker, args=(world_size, microbatch_size), nprocs=world_size, join=True)
-        tok = time.time()
-        logging.info(f"{microbatch_size=} execution_time={tok - tik:.3f}s")
+    main()
