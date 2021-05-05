@@ -30,9 +30,9 @@ class RemoteSeq(nn.Module):
 
     def forward(self, input_rref: RRef[torch.Tensor]):
         input_ = input_rref.to_here()  # block
-        with self._lock:
-            # ensure that only one microbatch is trained at a time
-            return self.seq(input_)
+        # ensure that only one microbatch is trained at a time
+        # with self._lock:
+        return self.seq(input_)
 
 
 class DistMNIST(nn.Module):
@@ -67,6 +67,30 @@ class DistMNIST(nn.Module):
         return list(chain.from_iterable(shard.remote_parameters() for shard in self.shards))
 
 
+def get_data(batch_size):    
+    trans = torchvision.transforms.Compose([
+        torchvision.transforms.ToTensor(),
+        lambda x: x.flatten()
+    ])
+    DATA_DIR = "../data/"
+    mnist = torchvision.datasets.MNIST(DATA_DIR, train=True, download=True, transform=trans)
+    trainloader = DataLoader(mnist, batch_size=batch_size, shuffle=True)
+    mnist_test = torchvision.datasets.MNIST(DATA_DIR, train=False, download=True, transform=trans)
+    testloader = DataLoader(mnist_test, batch_size=batch_size, shuffle=False)
+    return trainloader, testloader
+
+
+def evaluate(model, testloader):
+    correct, total = 0, 0
+    with torch.no_grad():
+        for inputs, labels in testloader:
+            outputs = model(inputs)
+            _, pred = torch.max(outputs.data, 1)
+            total += labels.size(0)
+            correct += (pred == labels).sum().item()
+    logging.info(f"Accuracy {correct * 100 / total:.2f}%")
+
+
 def run_master(batch_size, microbatch_size, num_workers):
     workers = [f"worker{i}/cpu" for i in range(1, num_workers + 1)]
     # TODO: Add support for CUDA, some minor changes needed in RemoteSeq.forward()
@@ -78,31 +102,13 @@ def run_master(batch_size, microbatch_size, num_workers):
         lr=0.05,
     )
 
-    trans = torchvision.transforms.Compose([
-        torchvision.transforms.ToTensor(),
-        lambda x: x.flatten()
-    ])
-    DATA_DIR = "../data/"
-    mnist = torchvision.datasets.MNIST(DATA_DIR, train=True, download=True, transform=trans)
-    loader = DataLoader(mnist, batch_size=batch_size, shuffle=True)
-    mnist_test = torchvision.datasets.MNIST(DATA_DIR, train=False, download=True, transform=trans)
-    testloader = DataLoader(mnist_test, batch_size=batch_size, shuffle=False)
-
-    def test(model, testloader):
-        correct, total = 0, 0
-        with torch.no_grad():
-            for inputs, labels in testloader:
-                outputs = model(inputs)
-                _, pred = torch.max(outputs.data, 1)
-                total += labels.size(0)
-                correct += (pred == labels).sum().item()
-        logging.info(f"Accuracy {correct * 100 / total:.2f}%")
+    trainloader, testloader = get_data(batch_size)
 
     logging.info("Starting")
-    for i, data in enumerate(loader):
+    for i, data in enumerate(trainloader):
         if i % 100 == 0:
             logging.info(f"Processing batch {i}")
-            test(model, testloader)
+            # test(model, testloader)
 
         inputs, labels = data
         # The distributed autograd context is the dedicated scope for the
@@ -113,11 +119,15 @@ def run_master(batch_size, microbatch_size, num_workers):
             dist_autograd.backward(context_id, [loss_fn(outputs, labels)])
             opt.step(context_id)
 
-    test(model, testloader)
+    evaluate(model, testloader)
 
 
 def run_worker(rank, world_size, batch_size, microbatch_size):
-    options = rpc.TensorPipeRpcBackendOptions(num_worker_threads=256)
+    options = rpc.TensorPipeRpcBackendOptions(
+        num_worker_threads=256,
+        _transports=["ibv", "uv"]  # default: ["ibv", "uv", "shm"], but shm is slow
+    )
+    # options = rpc.ProcessGroupRpcBackendOptions(num_send_recv_threads=128, rpc_timeout=20)
 
     if rank == 0:
         logging.info("Initting master")
@@ -125,6 +135,7 @@ def run_worker(rank, world_size, batch_size, microbatch_size):
             "master",
             rank=rank,
             world_size=world_size,
+            # backend=rpc.BackendType.PROCESS_GROUP,
             rpc_backend_options=options
         )
         run_master(batch_size, microbatch_size, world_size - 1)
@@ -133,6 +144,7 @@ def run_worker(rank, world_size, batch_size, microbatch_size):
         rpc.init_rpc(
             f"worker{rank}",
             rank=rank,
+            # backend=rpc.BackendType.PROCESS_GROUP,
             world_size=world_size,
             rpc_backend_options=options
         )
@@ -141,13 +153,13 @@ def run_worker(rank, world_size, batch_size, microbatch_size):
     rpc.shutdown()
 
 
-def gen_sizes(microbatch_size: list[int], batch_size: int) -> list[int]:
+def gen_sizes(microbatch_size: list, batch_size: int) -> list:
     """Generate the microbatch sizes if needed"""
     if not microbatch_size:
         # generate the sizes if not specified by user
         sizes = [batch_size]
         # sizes = [batch_size, batch_size / 2, batch_size / 4, ..., 1]
-        while sizes[-1] >= 2:
+        while sizes[-1] >= 8:
             sizes.append(sizes[-1] // 2)
     else:
         # use user-provided sizes
