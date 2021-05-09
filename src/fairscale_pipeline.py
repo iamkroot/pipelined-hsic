@@ -14,7 +14,7 @@ from torch.distributed.nn.api.remote_module import RemoteModule
 from torch.distributed.optim.optimizer import DistributedOptimizer
 from torch.distributed.rpc.api import RRef
 
-from vanilla_pipeline import gen_sizes, get_data, evaluate
+from vanilla_pipeline import get_data
 
 
 class RemoteModuleParams(NamedTuple):
@@ -58,7 +58,7 @@ def evaluate(model, testloader):
 
 
 def rpc_worker(rank, world_size, batch_size, microbatch_size):
-    options = rpc.TensorPipeRpcBackendOptions(_transports=["ibv", "uv", "shm"])
+    options = rpc.TensorPipeRpcBackendOptions(_transports=["ibv", "uv"])
     logging.info(f"Initting worker{rank}")
     rpc.init_rpc(
         "worker" + str(rank),
